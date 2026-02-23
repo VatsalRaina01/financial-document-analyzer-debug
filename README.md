@@ -101,6 +101,10 @@ redis-server
 
 **Terminal 2 — Celery Worker:**
 ```sh
+# Windows (requires --pool=solo due to no fork support):
+python -m celery -A worker worker --loglevel=info --pool=solo
+
+# macOS/Linux:
 celery -A worker worker --loglevel=info
 ```
 

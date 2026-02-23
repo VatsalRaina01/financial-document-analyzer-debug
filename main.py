@@ -1,82 +1,193 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from sqlalchemy.orm import Session
 import os
 import uuid
-import asyncio
 
-from crewai import Crew, Process
-from agents import financial_analyst, verifier, investment_advisor, risk_assessor
-from task import (
-    analyze_financial_document,
-    verification,
-    investment_analysis,
-    risk_assessment,
+from database import create_tables, get_db, AnalysisJob
+from worker import process_financial_document_task
+
+app = FastAPI(
+    title="Financial Document Analyzer",
+    description="AI-powered financial document analysis using CrewAI agents, "
+                "backed by a Redis/Celery task queue and SQLite database.",
+    version="2.0.0",
 )
 
-app = FastAPI(title="Financial Document Analyzer")
 
-def run_crew(query: str, file_path: str = "data/TSLA-Q2-2025-Update.pdf"):
-    """Run the full financial analysis crew pipeline."""
-    financial_crew = Crew(
-        agents=[verifier, financial_analyst, investment_advisor, risk_assessor],
-        tasks=[verification, analyze_financial_document, investment_analysis, risk_assessment],
-        process=Process.sequential,
-        verbose=True,
-    )
+@app.on_event("startup")
+async def startup_event():
+    """Create database tables on first run."""
+    create_tables()
 
-    result = financial_crew.kickoff({"query": query, "file_path": file_path})
-    return result
 
-@app.get("/")
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+@app.get("/", summary="Health Check")
 async def root():
-    """Health check endpoint"""
+    """Returns API status."""
     return {"message": "Financial Document Analyzer API is running"}
 
-@app.post("/analyze")
+
+# ---------------------------------------------------------------------------
+# Submit analysis job (async)
+# ---------------------------------------------------------------------------
+@app.post("/analyze", summary="Submit a financial document for analysis")
 async def analyze_document_endpoint(
     file: UploadFile = File(...),
     query: str = Form(default="Analyze this financial document for investment insights"),
+    db: Session = Depends(get_db),
 ):
-    """Analyze financial document and provide comprehensive investment recommendations"""
+    """
+    Upload a financial PDF and submit it for async analysis.
 
+    Returns a **job_id** immediately. The actual analysis runs in the background
+    via a Celery worker. Poll `/status/{job_id}` to track progress, then fetch
+    the full report from `/results/{job_id}`.
+    """
     file_id = str(uuid.uuid4())
     file_path = f"data/financial_document_{file_id}.pdf"
 
     try:
-        # Ensure data directory exists
         os.makedirs("data", exist_ok=True)
 
-        # Save uploaded file
+        # Save uploaded file to disk
         with open(file_path, "wb") as f:
             content = await file.read()
             f.write(content)
 
-        # Validate query
-        if query == "" or query is None:
+        # Normalise empty query
+        if not query or query.strip() == "":
             query = "Analyze this financial document for investment insights"
 
-        # Process the financial document with all analysts
-        response = run_crew(query=query.strip(), file_path=file_path)
+        # Persist job record to DB
+        job = AnalysisJob(
+            id=file_id,
+            filename=file.filename,
+            query=query.strip(),
+            status="pending",
+        )
+        db.add(job)
+        db.commit()
+
+        # Push task onto Celery queue (non-blocking)
+        process_financial_document_task.delay(file_id, query.strip(), file_path)
 
         return {
-            "status": "success",
-            "query": query,
-            "analysis": str(response),
+            "status": "queued",
+            "job_id": file_id,
+            "message": "Document submitted for analysis. Poll /status/{job_id} to track progress.",
             "file_processed": file.filename,
         }
 
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing financial document: {str(e)}",
-        )
-
-    finally:
-        # Clean up uploaded file
+        # Clean up file on submission error
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
-            except:
-                pass  # Ignore cleanup errors
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error queuing financial document: {str(e)}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Job status
+# ---------------------------------------------------------------------------
+@app.get("/status/{job_id}", summary="Check analysis job status")
+async def get_job_status(job_id: str, db: Session = Depends(get_db)):
+    """
+    Returns the current status of an analysis job.
+
+    **Statuses:** `pending` → `processing` → `completed` | `failed`
+    """
+    job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "filename": job.filename,
+        "query": job.query,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "error": job.error if job.status == "failed" else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fetch results
+# ---------------------------------------------------------------------------
+@app.get("/results/{job_id}", summary="Fetch completed analysis results")
+async def get_job_results(job_id: str, db: Session = Depends(get_db)):
+    """
+    Returns the full multi-agent analysis report once it is complete.
+    Returns a 202-style response if the job is still running.
+    """
+    job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status in ("pending", "processing"):
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "message": "Analysis is still in progress. Try again shortly.",
+        }
+
+    if job.status == "failed":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {job.error}",
+        )
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "filename": job.filename,
+        "query": job.query,
+        "analysis": job.result,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+@app.get("/history", summary="List past analysis jobs")
+async def get_analysis_history(
+    limit: int = 10,
+    db: Session = Depends(get_db),
+):
+    """
+    Returns the most recent `limit` analysis jobs (default 10), newest first.
+    Useful for reviewing past analyses without re-uploading documents.
+    """
+    jobs = (
+        db.query(AnalysisJob)
+        .order_by(AnalysisJob.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "total": len(jobs),
+        "jobs": [
+            {
+                "job_id": job.id,
+                "filename": job.filename,
+                "query": job.query,
+                "status": job.status,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            }
+            for job in jobs
+        ],
+    }
+
 
 if __name__ == "__main__":
     import uvicorn

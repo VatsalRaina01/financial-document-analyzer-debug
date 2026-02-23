@@ -28,8 +28,8 @@ financial_analyst = Agent(
     ),
     tools=[read_financial_document, search_tool],
     llm=llm,
-    max_iter=15,
-    max_rpm=10,
+    max_iter=5,
+    max_rpm=3,
     allow_delegation=False,
 )
 
@@ -50,8 +50,8 @@ verifier = Agent(
     ),
     tools=[read_financial_document],
     llm=llm,
-    max_iter=15,
-    max_rpm=10,
+    max_iter=5,
+    max_rpm=3,
     allow_delegation=False,
 )
 
@@ -72,8 +72,8 @@ investment_advisor = Agent(
     ),
     tools=[read_financial_document, search_tool],
     llm=llm,
-    max_iter=15,
-    max_rpm=10,
+    max_iter=5,
+    max_rpm=3,
     allow_delegation=False,
 )
 
@@ -93,7 +93,7 @@ risk_assessor = Agent(
     ),
     tools=[read_financial_document, search_tool],
     llm=llm,
-    max_iter=15,
-    max_rpm=10,
+    max_iter=5,
+    max_rpm=3,
     allow_delegation=False,
 )
